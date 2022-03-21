@@ -1,0 +1,1 @@
+cp -r ~/Downloads/v/vlib/v/{ast,checker,errors,parser,pref,scanner,token} .
