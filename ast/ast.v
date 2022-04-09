@@ -557,6 +557,7 @@ module ast
 // 	name               string // left.name()
 // 	is_method          bool
 // 	is_field           bool // temp hack, remove ASAP when re-impl CallExpr / Selector (joe)
+// 	is_fn_var          bool // fn variable
 // 	is_keep_alive      bool // GC must not free arguments before fn returns
 // 	is_noreturn        bool // whether the function/method is marked as [noreturn]
 // 	is_ctor_new        bool // if JS ctor calls requires `new` before call, marked as `[use_new]` in V
@@ -568,6 +569,7 @@ module ast
 // 	left_type          Type // type of `user`
 // 	receiver_type      Type // User
 // 	return_type        Type
+// 	fn_var_type        Type   // fn variable type
 // 	should_be_skipped  bool   // true for calls to `[if someflag?]` functions, when there is no `-d someflag`
 // 	concrete_types     []Type // concrete types, e.g. <int, string>
 // 	concrete_list_pos  token.Pos
@@ -608,23 +610,9 @@ module ast
 // 	types []Type
 // }
 
-// /*
-// pub enum Expr {
-// 	Binary(InfixExpr)
-// 	If(IfExpr)
-// 	Integer(IntegerExpr)
-// }
-// */
-// /*
-// pub struct Stmt {
-// 	pos int
-// 	//end int
-// }
-// */
 // pub struct Var {
 // pub:
 // 	name            string
-// 	expr            Expr
 // 	share           ShareType
 // 	is_mut          bool
 // 	is_autofree_tmp bool
@@ -632,6 +620,7 @@ module ast
 // 	is_auto_deref   bool
 // 	is_inherited    bool
 // pub mut:
+// 	expr       Expr
 // 	typ        Type
 // 	orig_type  Type   // original sumtype type; 0 if it's not a sumtype
 // 	smartcasts []Type // nested sum types require nested smart casting, for that a list of types is needed
@@ -792,11 +781,25 @@ module ast
 // 	name   string
 // 	kind   IdentKind
 // 	info   IdentInfo
-// 	is_mut bool
+// 	is_mut bool // if mut *token* is before name. Use `is_mut()` to lookup mut variable
+// }
+
+// pub fn (i &Ident) is_mut() bool {
+// 	match i.obj {
+// 		Var {
+// 			return i.obj.is_mut
+// 		}
+// 		ConstField {
+// 			return false
+// 		}
+// 		AsmRegister, GlobalField {
+// 			return true
+// 		}
+// 	}
 // }
 
 // pub fn (i &Ident) var_info() IdentVar {
-// 	match mut i.info {
+// 	match i.info {
 // 		IdentVar {
 // 			return i.info
 // 		}
@@ -997,7 +1000,6 @@ module ast
 // pub:
 // 	key_var    string
 // 	val_var    string
-// 	cond       Expr
 // 	is_range   bool
 // 	high       Expr // `10` in `for i in 0..10 {`
 // 	stmts      []Stmt
@@ -1005,6 +1007,7 @@ module ast
 // 	val_is_mut bool // `for mut val in vals {` means that modifying `val` will modify the array
 // 	// and the array cannot be indexed inside the loop
 // pub mut:
+// 	cond      Expr
 // 	key_type  Type
 // 	val_type  Type
 // 	cond_type Type
@@ -1692,10 +1695,10 @@ module ast
 
 // [inline]
 // pub fn (expr Expr) is_blank_ident() bool {
-// 	match expr {
-// 		Ident { return expr.kind == .blank_ident }
-// 		else { return false }
+// 	if expr is Ident {
+// 		return expr.kind == .blank_ident
 // 	}
+// 	return false
 // }
 
 // pub fn (expr Expr) pos() token.Pos {

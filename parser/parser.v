@@ -4,9 +4,9 @@
 [has_globals]
 module parser
 
-import scanner
-import ast
-import token
+import v.scanner
+import v.ast
+import v.token
 import v.pref
 import v.util
 import v.vet
@@ -19,6 +19,7 @@ pub struct Parser {
 mut:
 	file_base         string       // "hello.v"
 	file_name         string       // "/home/user/hello.v"
+	file_name_dir     string       // "/home/user"
 	unique_prefix     string       // a hash of p.file_name, used for making anon fn generation unique
 	file_backend_mode ast.Language // .c for .c.v|.c.vv|.c.vsh files; .js for .js.v files, .amd64/.rv32/other arches for .amd64.v/.rv32.v/etc. files, .v otherwise.
 	scanner           &scanner.Scanner
@@ -53,8 +54,9 @@ mut:
 	inside_asm_template       bool
 	inside_asm                bool
 	inside_defer              bool
-	inside_generic_params     bool       // indicates if parsing between `<` and `>` of a method/function
-	inside_receiver_param     bool       // indicates if parsing the receiver parameter inside the first `(` and `)` of a method
+	inside_generic_params     bool // indicates if parsing between `<` and `>` of a method/function
+	inside_receiver_param     bool // indicates if parsing the receiver parameter inside the first `(` and `)` of a method
+	inside_struct_field_decl  bool
 	or_is_handled             bool       // ignore `or` in this expression
 	builtin_mod               bool       // are we in the `builtin` module?
 	mod                       string     // current module name
@@ -104,6 +106,7 @@ pub fn parse_stmt(text string, table &ast.Table, scope &ast.Scope) ast.Stmt {
 		pref: &pref.Preferences{}
 		scope: scope
 	}
+	p.init_parse_fns()
 	util.timing_start('PARSE stmt')
 	defer {
 		util.timing_measure_cumulative('PARSE stmt')
@@ -112,11 +115,12 @@ pub fn parse_stmt(text string, table &ast.Table, scope &ast.Scope) ast.Stmt {
 	return p.stmt(false)
 }
 
-pub fn parse_comptime(text string, table &ast.Table, pref &pref.Preferences, scope &ast.Scope) &ast.File {
+pub fn parse_comptime(tmpl_path string, text string, table &ast.Table, pref &pref.Preferences, scope &ast.Scope) &ast.File {
 	$if trace_parse_comptime ? {
 		eprintln('> ${@MOD}.${@FN} text: $text')
 	}
 	mut p := Parser{
+		file_name: tmpl_path
 		scanner: scanner.new_scanner(text, .skip_comments, pref)
 		table: table
 		pref: pref
@@ -169,8 +173,8 @@ pub fn (mut p Parser) free_scanner() {
 pub fn (mut p Parser) set_path(path string) {
 	p.file_name = path
 	p.file_base = os.base(path)
-	file_name_dir := os.dir(path)
-	p.inside_vlib_file = file_name_dir.contains('vlib')
+	p.file_name_dir = os.dir(path)
+	p.inside_vlib_file = p.file_name_dir.contains('vlib')
 	p.inside_test_file = p.file_base.ends_with('_test.v') || p.file_base.ends_with('_test.vv')
 		|| p.file_base.all_before_last('.v').all_before_last('.').ends_with('_test')
 
@@ -267,40 +271,13 @@ pub fn parse_vet_file(path string, table_ &ast.Table, pref &pref.Preferences) (&
 	return file, p.vet_errors
 }
 
-pub fn (mut p Parser) parse2() ast.AstNode {
-	util.timing_start('PARSE')
-	defer {
-		util.timing_measure_cumulative('PARSE')
-	}
-
-	p.read_first_token()
-
-	mut root := ast.AstNode{typ: .root}
-
-
-	return root
-}
-
-pub fn (mut p Parser) parse_node() ast.AstNode {
-	match p.tok.kind {
-		.comment {
-			return p.comment()
-		}
-		.key_import {
-
-		}
-		else {
-
-		}
-	}
-}
-
 pub fn (mut p Parser) parse() &ast.File {
 	util.timing_start('PARSE')
 	defer {
 		util.timing_measure_cumulative('PARSE')
 	}
 	// comments_mode: comments_mode
+	p.init_parse_fns()
 	p.read_first_token()
 	mut stmts := []ast.Stmt{}
 	for p.tok.kind == .comment {
@@ -380,10 +357,66 @@ pub fn (mut p Parser) parse() &ast.File {
 	}
 }
 
+/*
+struct Queue {
+mut:
+	idx              int
+	mu               &sync.Mutex
+	mu2              &sync.Mutex
+	paths            []string
+	table            &ast.Table
+	parsed_ast_files []&ast.File
+	pref             &pref.Preferences
+	global_scope     &ast.Scope
+}
+
+fn (mut q Queue) run() {
+	for {
+		q.mu.lock()
+		idx := q.idx
+		if idx >= q.paths.len {
+			q.mu.unlock()
+			return
+		}
+		q.idx++
+		q.mu.unlock()
+		println('run(idx=$idx)')
+		path := q.paths[idx]
+		file := parse_file(path, q.table, .skip_comments, q.pref, q.global_scope)
+		q.mu2.lock()
+		q.parsed_ast_files << file
+		q.mu2.unlock()
+		println('run done(idx=$idx)')
+	}
+}
+*/
 pub fn parse_files(paths []string, table &ast.Table, pref &pref.Preferences) []&ast.File {
 	mut timers := util.new_timers(should_print: false, label: 'parse_files: $paths')
 	$if time_parsing ? {
 		timers.should_print = true
+	}
+	$if macos {
+		/*
+		if !pref.no_parallel && paths[0].contains('/array.v') {
+			println('\n\n\nparse_files() nr_files=$paths.len')
+			println(paths)
+			nr_cpus := runtime.nr_cpus()
+			mut q := &Queue{
+				paths: paths
+				table: table
+				pref: pref
+				global_scope: global_scope
+				mu: sync.new_mutex()
+				mu2: sync.new_mutex()
+			}
+			for _ in 0 .. nr_cpus - 1 {
+				go q.run()
+			}
+			time.sleep(time.second)
+			println('all done')
+			return q.parsed_ast_files
+		}
+		*/
 	}
 	mut files := []&ast.File{cap: paths.len}
 	for path in paths {
@@ -405,6 +438,11 @@ pub fn (mut p Parser) codegen(code string) {
 		eprintln('parser.codegen:\n $code')
 	}
 	p.codegen_text += '\n' + code
+}
+
+pub fn (mut p Parser) init_parse_fns() {
+	// p.prefix_parse_fns = make(100, 100, sizeof(PrefixParseFn))
+	// p.prefix_parse_fns[token.Kind.name] = parse_name
 }
 
 pub fn (mut p Parser) read_first_token() {
@@ -664,7 +702,7 @@ pub fn (mut p Parser) check_comment() ast.Comment {
 	return ast.Comment{}
 }
 
-pub fn (mut p Parser) comment() ast.AstNode {
+pub fn (mut p Parser) comment() ast.Comment {
 	mut pos := p.tok.pos()
 	text := p.tok.lit
 	num_newlines := text.count('\n')
@@ -677,7 +715,7 @@ pub fn (mut p Parser) comment() ast.AstNode {
 		p.vet_errors = p.vet_errors.filter(it.typ != .space_indent
 			|| it.pos.line_nr - 1 > pos.last_line || it.pos.line_nr - 1 <= pos.line_nr)
 	}
-	return ast.AstNode{
+	return ast.Comment{
 		text: text
 		is_multi: is_multi
 		is_inline: is_inline
@@ -1716,25 +1754,30 @@ pub fn (mut p Parser) error_with_pos(s string, pos token.Pos) ast.NodeError {
 	if p.pref.fatal_errors {
 		exit(1)
 	}
-
-	p.reporter.report(errors.Error{
-		file_path: p.file_name
-		pos: pos
-		source: .parser
-		message: s
-	})
-
-	if !p.reporter.is_silent && !p.pref.check_only {
+	mut kind := 'error:'
+	if p.pref.output_mode == .stdout && !p.pref.check_only {
+		if p.pref.is_verbose {
+			print_backtrace()
+			kind = 'parser error:'
+		}
+		ferror := util.formatted_error(kind, s, p.file_name, pos)
+		eprintln(ferror)
 		exit(1)
 	} else {
+		p.errors << errors.Error{
+			file_path: p.file_name
+			pos: pos
+			reporter: .parser
+			message: s
+		}
+
 		// To avoid getting stuck after an error, the parser
 		// will proceed to the next token.
 		if p.pref.check_only {
 			p.next()
 		}
 	}
-
-	if p.reporter.is_silent {
+	if p.pref.output_mode == .silent {
 		// Normally, parser errors mean that the parser exits immediately, so there can be only 1 parser error.
 		// In the silent mode however, the parser continues to run, even though it would have stopped. Some
 		// of the parser logic does not expect that, and may loop forever.
@@ -1742,7 +1785,7 @@ pub fn (mut p Parser) error_with_pos(s string, pos token.Pos) ast.NodeError {
 		p.next()
 	}
 	return ast.NodeError{
-		idx: p.reporter.error_count() - 1
+		idx: p.errors.len - 1
 		pos: pos
 	}
 }
@@ -1751,16 +1794,23 @@ pub fn (mut p Parser) error_with_error(error errors.Error) {
 	if p.pref.fatal_errors {
 		exit(1)
 	}
-	if p.reporter.reached_error_limit() {
-		p.should_abort = true
-		return
-	}
-	p.reporter.report(error)
-	if !p.reporter.is_silent && !p.pref.check_only {
+	mut kind := 'error:'
+	if p.pref.output_mode == .stdout && !p.pref.check_only {
+		if p.pref.is_verbose {
+			print_backtrace()
+			kind = 'parser error:'
+		}
+		ferror := util.formatted_error(kind, error.message, error.file_path, error.pos)
+		eprintln(ferror)
 		exit(1)
+	} else {
+		if p.pref.message_limit >= 0 && p.errors.len >= p.pref.message_limit {
+			p.should_abort = true
+			return
+		}
+		p.errors << error
 	}
-
-	if p.reporter.is_silent {
+	if p.pref.output_mode == .silent {
 		// Normally, parser errors mean that the parser exits immediately, so there can be only 1 parser error.
 		// In the silent mode however, the parser continues to run, even though it would have stopped. Some
 		// of the parser logic does not expect that, and may loop forever.
@@ -1777,16 +1827,41 @@ pub fn (mut p Parser) warn_with_pos(s string, pos token.Pos) {
 	if p.pref.skip_warnings {
 		return
 	}
-	if p.reporter.reached_warning_limit() {
-		p.should_abort = true
+	if p.pref.output_mode == .stdout && !p.pref.check_only {
+		ferror := util.formatted_error('warning:', s, p.file_name, pos)
+		eprintln(ferror)
+	} else {
+		if p.pref.message_limit >= 0 && p.warnings.len >= p.pref.message_limit {
+			p.should_abort = true
+			return
+		}
+		p.warnings << errors.Warning{
+			file_path: p.file_name
+			pos: pos
+			reporter: .parser
+			message: s
+		}
+	}
+}
+
+pub fn (mut p Parser) note_with_pos(s string, pos token.Pos) {
+	if p.pref.skip_warnings {
 		return
 	}
-	p.reporter.report(errors.Warning{
-		file_path: p.file_name
-		pos: pos
-		source: .parser
-		message: s
-	})
+	if p.is_generated {
+		return
+	}
+	if p.pref.output_mode == .stdout && !p.pref.check_only {
+		ferror := util.formatted_error('notice:', s, p.file_name, pos)
+		eprintln(ferror)
+	} else {
+		p.notices << errors.Notice{
+			file_path: p.file_name
+			pos: pos
+			reporter: .parser
+			message: s
+		}
+	}
 }
 
 pub fn (mut p Parser) vet_error(msg string, line int, fix vet.FixKind, typ vet.ErrorType) {
@@ -1870,6 +1945,7 @@ pub fn (mut p Parser) parse_ident(language ast.Language) ast.Ident {
 		p.register_auto_import('sync')
 	}
 	mut_pos := p.tok.pos()
+	modifier_kind := p.tok.kind
 	is_mut := p.tok.kind == .key_mut || is_shared || is_atomic
 	if is_mut {
 		p.next()
@@ -1883,7 +1959,11 @@ pub fn (mut p Parser) parse_ident(language ast.Language) ast.Ident {
 		p.next()
 	}
 	if p.tok.kind != .name {
-		p.error('unexpected token `$p.tok.lit`')
+		if is_mut || is_static || is_volatile {
+			p.error_with_pos('the `$modifier_kind` keyword is invalid here', mut_pos)
+		} else {
+			p.error('unexpected token `$p.tok.lit`')
+		}
 		return ast.Ident{
 			scope: p.scope
 		}
@@ -2117,7 +2197,7 @@ pub fn (mut p Parser) name_expr() ast.Expr {
 	}
 	// Raw string (`s := r'hello \n ')
 	if p.peek_tok.kind == .string && !p.inside_str_interp && p.peek_token(2).kind != .colon {
-		if p.tok.lit in ['r', 'c', 'js'] && p.tok.kind == .name {
+		if p.tok.kind == .name && p.tok.lit in ['r', 'c', 'js'] {
 			return p.string_expr()
 		} else {
 			// don't allow any other string prefix except `r`, `js` and `c`
@@ -2125,7 +2205,7 @@ pub fn (mut p Parser) name_expr() ast.Expr {
 		}
 	}
 	// don't allow r`byte` and c`byte`
-	if p.tok.lit in ['r', 'c'] && p.peek_tok.kind == .chartoken {
+	if p.peek_tok.kind == .chartoken && p.tok.lit.len == 1 && p.tok.lit[0] in [`r`, `c`] {
 		opt := if p.tok.lit == 'r' { '`r` (raw string)' } else { '`c` (c string)' }
 		return p.error('cannot use $opt with `byte` and `rune`')
 	}
@@ -3677,7 +3757,7 @@ fn (mut p Parser) rewind_scanner_to_current_token_in_new_mode() {
 
 // returns true if `varname` is known
 pub fn (mut p Parser) mark_var_as_used(varname string) bool {
-	if obj := p.scope.find(varname) {
+	if mut obj := p.scope.find(varname) {
 		match mut obj {
 			ast.Var {
 				obj.is_used = true

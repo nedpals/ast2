@@ -16,13 +16,14 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 	node.left_types = []
 	mut right_len := node.right.len
 	mut right_type0 := ast.void_type
-	for i, right in node.right {
+	for i, mut right in node.right {
 		if right in [ast.CallExpr, ast.IfExpr, ast.LockExpr, ast.MatchExpr] {
 			if right in [ast.IfExpr, ast.MatchExpr] && node.left.len == node.right.len && !is_decl
 				&& node.left[i] in [ast.Ident, ast.SelectorExpr] && !node.left[i].is_blank_ident() {
 				c.expected_type = c.expr(node.left[i])
 			}
 			right_type := c.expr(right)
+			c.fail_if_unreadable(right, right_type, 'right-hand side of assignment')
 			if i == 0 {
 				right_type0 = right_type
 				node.right_types = [
@@ -41,18 +42,18 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 				right_len = 0
 			}
 		}
-		if right is ast.InfixExpr {
+		if mut right is ast.InfixExpr {
 			if right.op == .arrow {
 				c.error('cannot use `<-` on the right-hand side of an assignment, as it does not return any values',
 					right.pos)
 			}
 		}
-		if right is ast.Ident {
+		if mut right is ast.Ident {
 			if right.is_mut {
 				c.error('unexpected `mut` on right-hand side of assignment', right.mut_pos)
 			}
 		}
-		if right is ast.None {
+		if mut right is ast.None {
 			c.error('you can not assign a `none` value to a variable', right.pos)
 		}
 	}
@@ -71,18 +72,18 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 		return
 	}
 
-	for i, left in node.left {
-		if left is ast.CallExpr {
+	for i, mut left in node.left {
+		if mut left is ast.CallExpr {
 			// ban `foo() = 10`
 			c.error('cannot call function `${left.name}()` on the left side of an assignment',
 				left.pos)
-		} else if left is ast.PrefixExpr {
+		} else if mut left is ast.PrefixExpr {
 			// ban `*foo() = 10`
 			if left.right is ast.CallExpr && left.op == .mul {
 				c.error('cannot dereference a function call on the left side of an assignment, use a temporary variable',
 					left.pos)
 			}
-		} else if left is ast.IndexExpr {
+		} else if mut left is ast.IndexExpr {
 			if left.index is ast.RangeExpr {
 				c.error('cannot reassign using range expression on the left side of an assignment',
 					left.pos)
@@ -99,8 +100,8 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 		}
 		if node.right_types.len < node.left.len { // first type or multi return types added above
 			old_inside_ref_lit := c.inside_ref_lit
-			if left is ast.Ident {
-				if left.info is ast.IdentVar {
+			if mut left is ast.Ident {
+				if mut left.info is ast.IdentVar {
 					c.inside_ref_lit = c.inside_ref_lit || left.info.share == .shared_t
 				}
 			}
@@ -112,9 +113,9 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 				node.right_types << c.check_expr_opt_call(node.right[i], right_type)
 			}
 		}
-		right := if i < node.right.len { node.right[i] } else { node.right[0] }
+		mut right := if i < node.right.len { node.right[i] } else { node.right[0] }
 		mut right_type := node.right_types[i]
-		if right is ast.Ident {
+		if mut right is ast.Ident {
 			right_sym := c.table.sym(right_type)
 			if right_sym.info is ast.Struct {
 				if right_sym.info.generic_types.len > 0 {
@@ -128,12 +129,12 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 		}
 		if is_decl {
 			// check generic struct init and return unwrap generic struct type
-			if right is ast.StructInit {
+			if mut right is ast.StructInit {
 				if right.typ.has_flag(.generic) {
 					c.expr(right)
 					right_type = right.typ
 				}
-			} else if right is ast.PrefixExpr {
+			} else if mut right is ast.PrefixExpr {
 				if right.op == .amp && right.right is ast.StructInit {
 					right_type = c.expr(right)
 				}
@@ -144,7 +145,7 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 				left_type = ast.mktyp(right_type)
 			}
 			if left_type == ast.int_type {
-				if right is ast.IntegerLiteral {
+				if mut right is ast.IntegerLiteral {
 					mut is_large := right.val.len > 13
 					if !is_large && right.val.len > 8 {
 						val := right.val.i64()
@@ -185,7 +186,7 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 		}
 		// Do not allow `a := 0; b := 0; a = &b`
 		if !is_decl && left is ast.Ident && !is_blank_ident && !left_type.is_real_pointer()
-			&& right_type.is_real_pointer() {
+			&& right_type.is_real_pointer() && !right_type.has_flag(.shared_f) {
 			left_sym := c.table.sym(left_type)
 			if left_sym.kind != .function {
 				c.warn(
@@ -244,7 +245,7 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 									}
 								}
 								if left_type in ast.unsigned_integer_type_idxs {
-									if right is ast.IntegerLiteral {
+									if mut right is ast.IntegerLiteral {
 										if right.val[0] == `-` {
 											c.error('Cannot assign negative value to unsigned integer type',
 												right.pos)
@@ -559,15 +560,10 @@ pub fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 					if right_node.right.obj is ast.Var {
 						v := right_node.right.obj
 						right_type0 = v.typ
-						if !v.is_mut && assigned_var.is_mut && !c.inside_unsafe {
-							c.error('`$right_node.right.name` is immutable, cannot have a mutable reference to it',
-								right_node.pos)
-						}
-					} else if right_node.right.obj is ast.ConstField {
-						if assigned_var.is_mut && !c.inside_unsafe {
-							c.error('`$right_node.right.name` is immutable, cannot have a mutable reference to it',
-								right_node.pos)
-						}
+					}
+					if !c.inside_unsafe && assigned_var.is_mut() && !right_node.right.is_mut() {
+						c.error('`$right_node.right.name` is immutable, cannot have a mutable reference to it',
+							right_node.pos)
 					}
 				}
 			}
